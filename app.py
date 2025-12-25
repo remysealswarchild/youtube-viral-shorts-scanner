@@ -8,6 +8,13 @@
 # - First-run friendly: if quota is exceeded and DB is empty, show clear "how to seed" guidance
 # - Seed DB mode: optional ultra-safe first-run scan budget to minimize quota usage
 #
+# Updates in this version (implemented):
+# - Channel metadata surfaced (created_at, subscribers, video_count, total_views) in Channels Explorer + Channel Profile drawer
+# - Drawer-like "Channel Profile" panel on the right side of Channels Explorer
+# - Loads channels metadata from DB (channels table) so drawer works in DB-first mode
+# - Uses channel fields from snapshot when present (scanner.load_latest_snapshot now joins channel metadata)
+# - More robust channel aggregation merge in fallback _channel_table
+#
 # Requirements:
 # - streamlit, pandas, numpy, plotly, python-dotenv
 # - sqlalchemy (required for DB-first/daily-scan mode)
@@ -64,11 +71,18 @@ except Exception:
         return agg.sort_values("score", ascending=False).reset_index(drop=True)
 
     def _channel_table(videos: pd.DataFrame, channels: pd.DataFrame) -> pd.DataFrame:
+        """
+        Sample-based channel table:
+        - Aggregates discovered Shorts per niche/channel
+        - Enriches with channel metadata when available
+        """
         if videos.empty:
             return pd.DataFrame(columns=[
-                "niche", "channel_id", "channel_title", "shorts_in_sample",
-                "sample_views_sum", "sample_views_median", "subscribers"
+                "niche", "channel_id", "channel_title",
+                "shorts_in_sample", "sample_views_sum", "sample_views_median",
+                "created_at", "subscribers", "video_count", "total_views"
             ])
+
         cagg = (videos.groupby(["niche", "channel_id", "channel_title"])
                 .agg(
                     shorts_in_sample=("video_id", "count"),
@@ -76,10 +90,17 @@ except Exception:
                     sample_views_median=("views", "median"),
                 )
                 .reset_index())
-        if not channels.empty and "subscribers" in channels.columns:
-            cagg = cagg.merge(channels[["channel_id", "subscribers"]], on="channel_id", how="left")
+
+        if channels is not None and not channels.empty and "channel_id" in channels.columns:
+            keep = [c for c in ["channel_id", "created_at", "subscribers", "video_count", "total_views"] if c in channels.columns]
+            if keep:
+                cagg = cagg.merge(channels[keep], on="channel_id", how="left")
         else:
+            cagg["created_at"] = None
             cagg["subscribers"] = None
+            cagg["video_count"] = None
+            cagg["total_views"] = None
+
         return cagg.sort_values(["niche", "sample_views_sum"], ascending=[True, False]).reset_index(drop=True)
 
 
@@ -112,7 +133,6 @@ def _has_snapshot_for_date(db_url: str, day_yyyy_mm_dd: str) -> bool:
             ).scalar()
         return int(n or 0) > 0
     except OperationalError:
-        # Table not created yet (no successful scan persisted)
         return False
     except Exception:
         return False
@@ -131,6 +151,44 @@ def _get_latest_date(db_url: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+# -----------------------------
+# Channels loader (DB-first support for drawer)
+# -----------------------------
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_load_channels_from_db(db_url: str) -> pd.DataFrame:
+    """
+    Load channels table (metadata) from SQLite.
+    Requires scanner.py to persist channels with:
+      created_at, subscribers, video_count, total_views
+    """
+    if not (db_url and _sqlalchemy_available()):
+        return pd.DataFrame()
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    engine = _db_engine(db_url)
+
+    try:
+        with engine.begin() as con:
+            df = pd.read_sql(text("""
+                SELECT
+                    channel_id,
+                    channel_title,
+                    created_at,
+                    subscribers,
+                    video_count,
+                    total_views,
+                    updated_at
+                FROM channels
+            """), con)
+        return df
+    except OperationalError:
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
 # -----------------------------
@@ -355,6 +413,15 @@ def _load_db_or_empty() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+def _load_channels_db_or_empty() -> pd.DataFrame:
+    if not db_ready:
+        return pd.DataFrame()
+    try:
+        df = _cached_load_channels_from_db(DB_URL)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
 def _render_empty_db_quota_message(e: Exception) -> None:
     st.error(
         "YouTube API quota is exceeded and the database is empty, so there is no snapshot to display.\n\n"
@@ -366,6 +433,112 @@ def _render_empty_db_quota_message(e: Exception) -> None:
         f"Details: {e}"
     )
 
+def _normalize_snapshot_channel_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    scanner.load_latest_snapshot may return channel_* columns from DB join.
+    Normalize them to expected names used by UI and drawer.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    rename_map = {}
+
+    if "channel_created_at" in out.columns and "created_at" not in out.columns:
+        rename_map["channel_created_at"] = "created_at"
+    if "channel_subscribers" in out.columns and "subscribers" not in out.columns:
+        rename_map["channel_subscribers"] = "subscribers"
+    if "channel_video_count" in out.columns and "video_count" not in out.columns:
+        rename_map["channel_video_count"] = "video_count"
+    if "channel_total_views" in out.columns and "total_views" not in out.columns:
+        rename_map["channel_total_views"] = "total_views"
+
+    if rename_map:
+        out = out.rename(columns=rename_map)
+
+    return out
+
+# Drawer renderer
+def _render_channel_profile_drawer(
+    selected_channel_id: str,
+    videos_df: pd.DataFrame,
+    channels_df: pd.DataFrame,
+    title: str = "Channel Profile",
+) -> None:
+    if not selected_channel_id:
+        st.info("Select a channel to view its profile.")
+        return
+
+    vch = videos_df[videos_df["channel_id"] == selected_channel_id].copy() if not videos_df.empty else pd.DataFrame()
+    chrow = pd.DataFrame()
+    if channels_df is not None and not channels_df.empty and "channel_id" in channels_df.columns:
+        chrow = channels_df[channels_df["channel_id"] == selected_channel_id].head(1)
+
+    # Identity fields
+    if not chrow.empty and "channel_title" in chrow.columns:
+        channel_title = chrow["channel_title"].iloc[0]
+    elif not vch.empty and "channel_title" in vch.columns:
+        channel_title = vch["channel_title"].iloc[0]
+    else:
+        channel_title = selected_channel_id
+
+    channel_url = f"https://www.youtube.com/channel/{selected_channel_id}"
+
+    st.subheader(title)
+    st.markdown(f"**{channel_title}**")
+    st.markdown(f"Channel URL: {channel_url}")
+
+    created_at = chrow["created_at"].iloc[0] if (not chrow.empty and "created_at" in chrow.columns) else None
+    subscribers = chrow["subscribers"].iloc[0] if (not chrow.empty and "subscribers" in chrow.columns) else None
+    video_count = chrow["video_count"].iloc[0] if (not chrow.empty and "video_count" in chrow.columns) else None
+    total_views = chrow["total_views"].iloc[0] if (not chrow.empty and "total_views" in chrow.columns) else None
+
+    m1, m2 = st.columns(2)
+    m1.metric("Subscribers", "Hidden" if pd.isna(subscribers) else f"{int(subscribers):,}")
+    m2.metric("Total channel views", "—" if pd.isna(total_views) else f"{int(total_views):,}")
+
+    m3, m4 = st.columns(2)
+    m3.metric("Total uploaded videos", "—" if pd.isna(video_count) else f"{int(video_count):,}")
+    m4.metric("Channel created", "—" if not created_at else str(created_at)[:10])
+
+    st.divider()
+
+    if vch.empty:
+        st.info("No sampled Shorts for this channel in the current dataset/snapshot.")
+        return
+
+    sampled_count = len(vch)
+    sampled_views_sum = int(vch["views"].sum()) if "views" in vch.columns else 0
+    sampled_views_med = float(vch["views"].median()) if "views" in vch.columns else 0.0
+    sampled_vpd_med = float(vch["views_per_day"].median()) if "views_per_day" in vch.columns else 0.0
+
+    s1, s2 = st.columns(2)
+    s1.metric("Sampled Shorts (scanner)", f"{sampled_count:,}")
+    s2.metric("Sampled views (sum)", f"{sampled_views_sum:,}")
+
+    s3, s4 = st.columns(2)
+    s3.metric("Sampled views (median)", f"{int(sampled_views_med):,}")
+    s4.metric("Sampled views/day (median)", f"{int(sampled_vpd_med):,}")
+
+    # top niches in sample
+    if "niche" in vch.columns and not vch["niche"].isna().all():
+        niche_counts = (vch["niche"].value_counts().head(10).reset_index())
+        niche_counts.columns = ["niche", "shorts_in_sample"]
+        fig = px.bar(niche_counts, x="niche", y="shorts_in_sample")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**Top sampled Shorts (by views/day)**")
+    sort_key = "views_per_day" if "views_per_day" in vch.columns else ("views" if "views" in vch.columns else None)
+    if sort_key:
+        vch = vch.sort_values(sort_key, ascending=False)
+
+    cols = [c for c in [
+        "niche", "title", "views", "views_per_day", "shorts_score", "published_at", "video_url"
+    ] if c in vch.columns]
+
+    st.dataframe(vch[cols].head(25), use_container_width=True, height=420)
+
+# Run/load logic
 if run_btn:
     st.cache_data.clear()
     if not db_ready:
@@ -373,8 +546,9 @@ if run_btn:
     elif _has_snapshot_for_date(DB_URL, today_utc):
         st.info(f"Daily scan already ran for {today_utc}. Loading DB snapshot.")
         snap = _load_db_or_empty()
+        snap = _normalize_snapshot_channel_cols(snap)
         videos = _ensure_urls(snap)
-        channels = pd.DataFrame()
+        channels = _load_channels_db_or_empty()
         data_source_label = "SQLite snapshot"
     else:
         with st.spinner("Running daily scan (YouTube API) and persisting to DB..."):
@@ -390,8 +564,9 @@ if run_btn:
                         "Scan failed (quota/API issue). Showing latest saved DB snapshot instead.\n\n"
                         f"Details: {e}"
                     )
+                    snap = _normalize_snapshot_channel_cols(snap)
                     videos = _ensure_urls(snap)
-                    channels = pd.DataFrame()
+                    channels = _load_channels_db_or_empty()
                     data_source_label = "SQLite snapshot"
                 else:
                     _render_empty_db_quota_message(e)
@@ -406,7 +581,10 @@ elif load_latest_btn:
             st.warning("No snapshot found in DB yet. Run the daily scan once to populate the database.")
             videos, channels, data_source_label = pd.DataFrame(), pd.DataFrame(), "None"
         else:
-            videos, channels, data_source_label = _ensure_urls(snap), pd.DataFrame(), "SQLite snapshot"
+            snap = _normalize_snapshot_channel_cols(snap)
+            videos = _ensure_urls(snap)
+            channels = _load_channels_db_or_empty()
+            data_source_label = "SQLite snapshot"
 
 else:
     # Default: always use DB snapshot (no scanning on page load)
@@ -419,7 +597,10 @@ else:
         videos, channels, data_source_label = pd.DataFrame(), pd.DataFrame(), "None"
     else:
         st.info("Showing latest saved snapshot from database. Scans run at most once per day.")
-        videos, channels, data_source_label = _ensure_urls(snap), pd.DataFrame(), "SQLite snapshot"
+        snap = _normalize_snapshot_channel_cols(snap)
+        videos = _ensure_urls(snap)
+        channels = _load_channels_db_or_empty()
+        data_source_label = "SQLite snapshot"
 
 # -----------------------------
 # Header stats
@@ -481,21 +662,35 @@ with tab2:
 
         cols = [c for c in [
             "niche", "title", "channel_title", "views", "views_per_day",
-            "shorts_score", "duration_s", "published_at", "video_url", "channel_url", "source_query"
+            "shorts_score", "duration_s", "published_at", "video_url", "channel_url", "source_query",
+            "created_at", "subscribers", "video_count", "total_views"
         ] if c in vf.columns]
 
         st.dataframe(vf[cols], use_container_width=True, height=520)
         st.caption("Copy/paste video_url or channel_url into your browser.")
 
 # -----------------------------
-# Tab 3: Channels Explorer
+# Tab 3: Channels Explorer + Channel Profile drawer
 # -----------------------------
 with tab3:
     st.subheader("Channels Explorer")
+
     if videos.empty:
         st.info("No channels available.")
     else:
-        channels_df = pd.DataFrame(columns=["channel_id", "channel_title", "subscribers"])
+        # Build a channels metadata table for enrichment:
+        # - prefer DB channels table (DB-first), but live scan channels also works.
+        channels_df = channels.copy() if (channels is not None and not channels.empty) else _load_channels_db_or_empty()
+
+        # If snapshot already includes channel columns, optionally back-fill channels_df from snapshot
+        # (helps if channels table isn't populated for older DBs)
+        if (channels_df is None or channels_df.empty) and not videos.empty:
+            possible = ["channel_id", "channel_title", "created_at", "subscribers", "video_count", "total_views"]
+            if all(c in videos.columns for c in ["channel_id", "channel_title"]) and any(c in videos.columns for c in possible[2:]):
+                channels_df = (videos[possible]
+                               .drop_duplicates("channel_id")
+                               .rename(columns={"channel_title": "channel_title"}))
+
         ct = _channel_table(videos, channels_df)
 
         niches_sorted = sorted(ct["niche"].dropna().unique().tolist()) if not ct.empty else []
@@ -505,13 +700,55 @@ with tab3:
         if selected_niche_c != "(All)":
             cf = cf[cf["niche"] == selected_niche_c].copy()
 
-        ch_sort = st.selectbox("Sort channels by", options=["sample_views_sum", "shorts_in_sample", "sample_views_median", "subscribers"], index=0)
+        ch_sort = st.selectbox(
+            "Sort channels by",
+            options=[
+                "sample_views_sum", "shorts_in_sample", "sample_views_median",
+                "subscribers", "total_views", "video_count"
+            ],
+            index=0
+        )
         ch_asc = st.checkbox("Ascending (channels)", value=False)
 
         if ch_sort in cf.columns:
             cf = cf.sort_values(ch_sort, ascending=ch_asc)
 
-        st.dataframe(cf, use_container_width=True, height=520)
+        left, right = st.columns([1.4, 1.0], gap="large")
+
+        with left:
+            st.markdown("**Channel list (sample-based)**")
+            preferred_cols = [
+                "niche", "channel_title",
+                "subscribers", "total_views", "video_count", "created_at",
+                "shorts_in_sample", "sample_views_sum", "sample_views_median",
+                "channel_id"
+            ]
+            show_cols = [c for c in preferred_cols if c in cf.columns]
+            st.dataframe(cf[show_cols], use_container_width=True, height=520)
+
+        with right:
+            st.markdown("**Channel Profile**")
+
+            channel_options = []
+            if not cf.empty and "channel_id" in cf.columns and "channel_title" in cf.columns:
+                channel_options = [
+                    f"{r['channel_title']} | {r['channel_id']}"
+                    for _, r in cf[["channel_title", "channel_id"]].drop_duplicates().head(200).iterrows()
+                ]
+
+            selected = st.selectbox("Select a channel", options=["(Select)"] + channel_options)
+
+            if selected != "(Select)":
+                selected_channel_id = selected.split("|")[-1].strip()
+                with st.expander("Open drawer", expanded=True):
+                    _render_channel_profile_drawer(
+                        selected_channel_id=selected_channel_id,
+                        videos_df=videos,
+                        channels_df=channels_df if channels_df is not None else pd.DataFrame(),
+                        title="Channel Profile",
+                    )
+            else:
+                st.info("Pick a channel to view creation date, subscribers, total views, uploads, and top Shorts.")
 
 # -----------------------------
 # Tab 4: Emerging niches
@@ -547,5 +784,6 @@ with st.expander("Operational notes (API & quotas)"):
 - Daily scans are allowed once per UTC day ({today_utc}). After that, the scan button is disabled.
 - If a scan fails due to quota/API limits, the UI automatically falls back to the latest DB snapshot.
 - If the DB is empty and quota is exceeded, keep Seed DB mode enabled and run once after quota resets.
+- Channels Explorer includes a Channel Profile drawer (right panel) with channel metadata + top sampled Shorts.
         """
     )

@@ -1,18 +1,11 @@
 # scanner.py
 # YouTube Shorts Virality Scanner (Data Collector)
 #
-# Features:
-# - Global scan, last N days (default 30)
-# - Better Shorts detection: duration <= 75s + heuristic scoring (keywords + query prior)
-# - De-duplication: unique video IDs per niche and across queries
-# - Optional SQLite persistence (via SQLAlchemy) for weekly trend analysis
-#
-# Expected companion file:
-# - niches.py containing QUERY_PACKS (dict[str, list[str]])
-#
-# Environment:
-# - YOUTUBE_API_KEY required
-# - DB_URL optional (e.g., sqlite:///yt_shorts.db). If not set, runs in-memory only.
+# Updates (per your request):
+# - Explicit quota/API failure detection (HttpError 403 quotaExceeded/dailyLimitExceeded/rateLimitExceeded)
+# - Bubble up quota/API failures so app.py can fall back to DB snapshot
+# - More robust error handling (keeps non-quota errors contained where appropriate)
+# - Adds helpful DB indices for faster trend queries
 
 from __future__ import annotations
 
@@ -37,6 +30,30 @@ except Exception:
 
 
 # -----------------------------
+# Error helpers (quota detection)
+# -----------------------------
+
+def _http_error_text(e: HttpError) -> str:
+    try:
+        # googleapiclient HttpError often includes JSON details in str(e)
+        return str(e)
+    except Exception:
+        return "HttpError"
+
+def _is_quota_error(e: HttpError) -> bool:
+    """
+    Detect quota/rate-limit issues that should trigger UI fallback to DB.
+    """
+    msg = _http_error_text(e)
+    tokens = ("quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded")
+    return any(t in msg for t in tokens) or getattr(e, "status_code", None) == 403
+
+def _raise_if_quota(e: HttpError) -> None:
+    if _is_quota_error(e):
+        raise e
+
+
+# -----------------------------
 # Shorts heuristics
 # -----------------------------
 
@@ -56,7 +73,6 @@ def shorts_confidence(duration_s: int, title: Optional[str], desc: Optional[str]
     """
     score = 0.0
 
-    # Duration prior
     if duration_s <= 60:
         score += 0.70
     elif duration_s <= 75:
@@ -66,12 +82,10 @@ def shorts_confidence(duration_s: int, title: Optional[str], desc: Optional[str]
     else:
         score -= 0.50
 
-    # Text cues (#shorts etc.)
     text = f"{title or ''}\n{desc or ''}"
     if SHORTS_KEYWORDS.search(text):
         score += 0.25
 
-    # Query hint prior (if your query packs include "shorts")
     if query_hint and "short" in query_hint.lower():
         score += 0.10
 
@@ -121,11 +135,18 @@ def _init_db(engine):
         );
         """))
 
+        # indices for faster UI queries
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_date ON video_stats_daily(date);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_niche ON video_stats_daily(niche);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);"))
+
 def _upsert_videos(engine, df: pd.DataFrame):
     if df.empty:
         return
     cols = ["video_id", "title", "description", "channel_id", "channel_title", "published_at", "duration_s"]
-    df = df[cols].drop_duplicates("video_id")
+    df = df[cols].drop_duplicates("video_id").copy()
+    df["duration_s"] = pd.to_numeric(df["duration_s"], errors="coerce").fillna(0).astype(int)
+
     with engine.begin() as con:
         for _, r in df.iterrows():
             con.execute(text("""
@@ -143,6 +164,10 @@ def _upsert_videos(engine, df: pd.DataFrame):
 def _upsert_channels(engine, df: pd.DataFrame):
     if df.empty:
         return
+    df = df.copy()
+    if "subscribers" in df.columns:
+        df["subscribers"] = pd.to_numeric(df["subscribers"], errors="coerce").astype("Int64")
+
     with engine.begin() as con:
         for _, r in df.iterrows():
             con.execute(text("""
@@ -158,7 +183,11 @@ def _insert_daily_stats(engine, df_stats: pd.DataFrame):
     if df_stats.empty:
         return
     cols = ["video_id", "date", "views", "views_per_day", "niche", "shorts_score", "source_query"]
-    df_stats = df_stats[cols]
+    df_stats = df_stats[cols].copy()
+    df_stats["views"] = pd.to_numeric(df_stats["views"], errors="coerce").fillna(0).astype(int)
+    df_stats["views_per_day"] = pd.to_numeric(df_stats["views_per_day"], errors="coerce").fillna(0.0).astype(float)
+    df_stats["shorts_score"] = pd.to_numeric(df_stats["shorts_score"], errors="coerce").fillna(0.0).astype(float)
+
     with engine.begin() as con:
         for _, r in df_stats.iterrows():
             con.execute(text("""
@@ -194,7 +223,6 @@ def load_latest_snapshot(db_url: str) -> pd.DataFrame:
 
 def _iso_days_ago(days: int) -> str:
     dt = datetime.now(timezone.utc) - timedelta(days=int(days))
-    # YouTube expects RFC3339; "Z" is accepted for UTC
     return dt.isoformat().replace("+00:00", "Z")
 
 def fetch_candidates(
@@ -205,7 +233,7 @@ def fetch_candidates(
 ) -> List[str]:
     """
     Uses search.list to fetch candidate video IDs.
-    order=viewCount makes it biased toward high views, which you want for virality scanning.
+    order=viewCount biases toward high views (virality scanning).
     """
     try:
         resp = youtube.search().list(
@@ -216,12 +244,13 @@ def fetch_candidates(
             publishedAfter=published_after_iso,
             maxResults=max_results,
         ).execute()
-    except HttpError:
+    except HttpError as e:
+        _raise_if_quota(e)
         return []
     except Exception:
         return []
 
-    ids = []
+    ids: List[str] = []
     for it in resp.get("items", []):
         vid = (it.get("id") or {}).get("videoId")
         if vid:
@@ -236,8 +265,8 @@ def fetch_videos(youtube, video_ids: List[str]) -> pd.DataFrame:
     rows = []
     if not video_ids:
         return pd.DataFrame(columns=[
-            "video_id","title","description","channel_id","channel_title",
-            "published_at","duration_s","views"
+            "video_id", "title", "description", "channel_id", "channel_title",
+            "published_at", "duration_s", "views"
         ])
 
     for i in range(0, len(video_ids), 50):
@@ -247,7 +276,8 @@ def fetch_videos(youtube, video_ids: List[str]) -> pd.DataFrame:
                 part="snippet,contentDetails,statistics",
                 id=",".join(batch),
             ).execute()
-        except HttpError:
+        except HttpError as e:
+            _raise_if_quota(e)
             continue
         except Exception:
             continue
@@ -284,6 +314,7 @@ def fetch_channels(youtube, channel_ids: List[str]) -> pd.DataFrame:
 
     rows = []
     uniq = list(dict.fromkeys([c for c in channel_ids if c]))
+
     for i in range(0, len(uniq), 50):
         batch = uniq[i:i+50]
         try:
@@ -291,7 +322,8 @@ def fetch_channels(youtube, channel_ids: List[str]) -> pd.DataFrame:
                 part="snippet,statistics",
                 id=",".join(batch),
             ).execute()
-        except HttpError:
+        except HttpError as e:
+            _raise_if_quota(e)
             continue
         except Exception:
             continue
@@ -324,8 +356,7 @@ class ScanBudget:
     max_results_per_query: int = 25
     scan_days: int = 30
     shorts_score_threshold: float = 0.60
-    max_videos_per_niche: int = 120  # cap after Shorts filtering (optional)
-    # Note: caching TTL belongs in Streamlit (app.py), not here.
+    max_videos_per_niche: int = 120
 
 
 # -----------------------------
@@ -341,17 +372,12 @@ def run_scan(
     """
     Runs a scan over the provided query packs.
 
+    Behavior:
+    - If quota is exceeded or rate limited, raises HttpError so UI can fall back to DB.
+    - If db_url is provided and SQLAlchemy is available, persists results to SQLite.
+
     Returns:
-      videos_df: per-video table (for dashboard)
-      channels_df: per-channel table (optional enrichment)
-
-    If db_url is provided (e.g., sqlite:///yt_shorts.db) and SQLAlchemy is installed,
-    the scan will persist:
-      - videos metadata
-      - channel metadata
-      - daily stats snapshot (views, views/day, niche, shorts_score)
-
-    The dashboard can then load latest snapshot via load_latest_snapshot(db_url).
+      videos_df, channels_df
     """
     if budget is None:
         budget = ScanBudget()
@@ -359,7 +385,6 @@ def run_scan(
     youtube = build("youtube", "v3", developerKey=api_key)
     published_after = _iso_days_ago(budget.scan_days)
 
-    # Optional DB init
     engine = None
     if db_url:
         if not SQLALCHEMY_AVAILABLE:
@@ -368,21 +393,19 @@ def run_scan(
         _init_db(engine)
 
     all_videos = []
-    # We also build a global dedupe set to reduce duplicate fetch work across niches.
     global_seen_video_ids = set()
 
     for niche, queries in query_packs.items():
         if not queries:
             continue
 
-        # Enforce budgeted number of queries per niche
         qlist = queries[: budget.queries_per_niche]
 
-        # Collect video IDs, and remember which query found which video (first hit wins)
         found_by: Dict[str, str] = {}
         niche_video_ids: List[str] = []
 
         for q in qlist:
+            # If quota is exceeded here, HttpError will bubble up to app.py
             ids = fetch_candidates(
                 youtube,
                 query=q,
@@ -398,15 +421,13 @@ def run_scan(
         if not niche_video_ids:
             continue
 
-        # Dedupe across niches to reduce redundant videos.list calls
-        # (We still keep niche assignment by discovery; if a video appears in multiple niches,
-        # the first niche processed will own it in this run.)
         niche_video_ids = [vid for vid in niche_video_ids if vid not in global_seen_video_ids]
         global_seen_video_ids.update(niche_video_ids)
 
         if not niche_video_ids:
             continue
 
+        # If quota is exceeded here, HttpError will bubble up to app.py
         dfv = fetch_videos(youtube, niche_video_ids)
         if dfv.empty:
             continue
@@ -414,7 +435,6 @@ def run_scan(
         dfv["niche"] = niche
         dfv["source_query"] = dfv["video_id"].map(found_by)
 
-        # Compute shorts_score and filter
         dfv["shorts_score"] = dfv.apply(
             lambda r: shorts_confidence(
                 int(r.get("duration_s", 0) or 0),
@@ -424,18 +444,16 @@ def run_scan(
             ),
             axis=1,
         )
+
         dfv = dfv[dfv["shorts_score"] >= budget.shorts_score_threshold].copy()
         if dfv.empty:
             continue
 
-        # Optional cap after filtering (keeps dashboard responsive & controls quota)
         dfv = dfv.sort_values("views", ascending=False).head(budget.max_videos_per_niche).copy()
 
-        # Views per day
         now = datetime.now(timezone.utc)
         pub = pd.to_datetime(dfv["published_at"], utc=True, errors="coerce")
         age_days = (now - pub).dt.total_seconds() / 86400.0
-        # Protect against divide-by-zero and “fresh upload spikes”
         age_days = age_days.clip(lower=0.25)
         dfv["views_per_day"] = dfv["views"] / age_days
 
@@ -445,12 +463,12 @@ def run_scan(
         pd.concat(all_videos, ignore_index=True)
         if all_videos
         else pd.DataFrame(columns=[
-            "video_id","title","description","channel_id","channel_title","published_at",
-            "duration_s","views","niche","source_query","shorts_score","views_per_day"
+            "video_id", "title", "description", "channel_id", "channel_title", "published_at",
+            "duration_s", "views", "niche", "source_query", "shorts_score", "views_per_day"
         ])
     )
 
-    # Channel enrichment
+    # Channel enrichment (quota errors bubble up)
     channels = fetch_channels(youtube, videos["channel_id"].dropna().unique().tolist())
 
     # Add convenient URLs for UI
@@ -476,7 +494,6 @@ def run_scan(
 # -----------------------------
 
 if __name__ == "__main__":
-    # Basic local test run (without Streamlit)
     from niches import QUERY_PACKS
 
     api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
@@ -493,14 +510,18 @@ if __name__ == "__main__":
         max_videos_per_niche=int(os.getenv("MAX_VIDEOS_PER_NICHE", "120")),
     )
 
-    videos_df, channels_df = run_scan(
-        api_key=api_key,
-        query_packs=QUERY_PACKS,
-        budget=budget,
-        db_url=db_url,
-    )
+    try:
+        videos_df, channels_df = run_scan(
+            api_key=api_key,
+            query_packs=QUERY_PACKS,
+            budget=budget,
+            db_url=db_url,
+        )
+        print(f"Videos: {len(videos_df)} | Channels: {len(channels_df)}")
+    except HttpError as e:
+        print("API scan failed (likely quota/rate limit).")
+        print(str(e))
 
-    print(f"Videos: {len(videos_df)} | Channels: {len(channels_df)}")
-    if db_url:
+    if db_url and SQLALCHEMY_AVAILABLE:
         snap = load_latest_snapshot(db_url)
         print(f"Latest DB snapshot rows: {len(snap)}")

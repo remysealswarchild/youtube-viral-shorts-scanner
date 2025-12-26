@@ -9,11 +9,13 @@
 # - Seed DB mode: optional ultra-safe first-run scan budget to minimize quota usage
 #
 # Updates in this version (implemented):
-# - Channel metadata surfaced (created_at, subscribers, video_count, total_views) in Channels Explorer + Channel Profile drawer
-# - Drawer-like "Channel Profile" panel on the right side of Channels Explorer
-# - Loads channels metadata from DB (channels table) so drawer works in DB-first mode
-# - Uses channel fields from snapshot when present (scanner.load_latest_snapshot now joins channel metadata)
-# - More robust channel aggregation merge in fallback _channel_table
+# - Channel metadata surfaced (created_at, subscribers, video_count, total_views)
+# - Channel Profile persists in st.sidebar (not right column) while scrolling
+# - Adds "Niche Deep Scan" (API) for a selected niche:
+#     - Runs niche-specific YouTube API scan for viral Shorts (quota permitting)
+#     - Persists results into DB via scanner.run_niche_scan()
+#     - DB-first browsing of the latest niche deep scan via scanner.load_latest_niche_scan()
+#     - Run history table via scanner.load_niche_scan_runs()
 #
 # Requirements:
 # - streamlit, pandas, numpy, plotly, python-dotenv
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,7 +38,15 @@ import plotly.express as px
 from dotenv import load_dotenv
 
 from niches import QUERY_PACKS
-from scanner import run_scan, ScanBudget, load_latest_snapshot
+from scanner import (
+    run_scan,
+    run_niche_scan,
+    ScanBudget,
+    load_latest_snapshot,
+    load_latest_niche_scan,
+    load_niche_scan_runs,
+    load_channels_table,
+)
 
 # Prefer scoring.py if present; fallback implementations provided otherwise.
 try:
@@ -92,7 +102,8 @@ except Exception:
                 .reset_index())
 
         if channels is not None and not channels.empty and "channel_id" in channels.columns:
-            keep = [c for c in ["channel_id", "created_at", "subscribers", "video_count", "total_views"] if c in channels.columns]
+            keep = [c for c in ["channel_id", "created_at", "subscribers", "video_count", "total_views"]
+                    if c in channels.columns]
             if keep:
                 cagg = cagg.merge(channels[keep], on="channel_id", how="left")
         else:
@@ -115,16 +126,12 @@ def _sqlalchemy_available() -> bool:
     except Exception:
         return False
 
-def _db_engine(db_url: str):
-    from sqlalchemy import create_engine
-    return create_engine(db_url, future=True)
-
 def _has_snapshot_for_date(db_url: str, day_yyyy_mm_dd: str) -> bool:
     if not (db_url and _sqlalchemy_available()):
         return False
-    from sqlalchemy import text
+    from sqlalchemy import text, create_engine
     from sqlalchemy.exc import OperationalError
-    engine = _db_engine(db_url)
+    engine = create_engine(db_url, future=True)
     try:
         with engine.begin() as con:
             n = con.execute(
@@ -140,9 +147,9 @@ def _has_snapshot_for_date(db_url: str, day_yyyy_mm_dd: str) -> bool:
 def _get_latest_date(db_url: str) -> Optional[str]:
     if not (db_url and _sqlalchemy_available()):
         return None
-    from sqlalchemy import text
+    from sqlalchemy import text, create_engine
     from sqlalchemy.exc import OperationalError
-    engine = _db_engine(db_url)
+    engine = create_engine(db_url, future=True)
     try:
         with engine.begin() as con:
             d = con.execute(text("SELECT MAX(date) FROM video_stats_daily")).scalar()
@@ -154,53 +161,20 @@ def _get_latest_date(db_url: str) -> Optional[str]:
 
 
 # -----------------------------
-# Channels loader (DB-first support for drawer)
-# -----------------------------
-
-@st.cache_data(ttl=60 * 10, show_spinner=False)
-def _cached_load_channels_from_db(db_url: str) -> pd.DataFrame:
-    """
-    Load channels table (metadata) from SQLite.
-    Requires scanner.py to persist channels with:
-      created_at, subscribers, video_count, total_views
-    """
-    if not (db_url and _sqlalchemy_available()):
-        return pd.DataFrame()
-
-    from sqlalchemy import text
-    from sqlalchemy.exc import OperationalError
-    engine = _db_engine(db_url)
-
-    try:
-        with engine.begin() as con:
-            df = pd.read_sql(text("""
-                SELECT
-                    channel_id,
-                    channel_title,
-                    created_at,
-                    subscribers,
-                    video_count,
-                    total_views,
-                    updated_at
-                FROM channels
-            """), con)
-        return df
-    except OperationalError:
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
-# -----------------------------
-# DB helper for "emerging niches"
+# DB helper for "emerging niches"  (FIX: included)
 # -----------------------------
 
 def _load_emerging_niches(db_url: str, window_days: int = 7) -> pd.DataFrame:
+    """
+    Emerging niches: compare last N days vs previous N days using a niche-level score.
+    Requires video_stats_daily table in SQLite.
+    """
     if not db_url or not _sqlalchemy_available():
         return pd.DataFrame()
 
     from sqlalchemy import create_engine, text
     from sqlalchemy.exc import OperationalError
+
     engine = create_engine(db_url, future=True)
 
     with engine.begin() as con:
@@ -217,14 +191,18 @@ def _load_emerging_niches(db_url: str, window_days: int = 7) -> pd.DataFrame:
         prev_end = last_start - timedelta(days=1)
         prev_start = prev_end - timedelta(days=window_days - 1)
 
-        df = pd.read_sql(text("""
-            SELECT date, niche, views, views_per_day
-            FROM video_stats_daily
-            WHERE date BETWEEN :prev_start AND :max_date
-        """), con, params={
-            "prev_start": prev_start.isoformat(),
-            "max_date": max_dt.isoformat()
-        })
+        df = pd.read_sql(
+            text("""
+                SELECT date, niche, views, views_per_day
+                FROM video_stats_daily
+                WHERE date BETWEEN :prev_start AND :max_date
+            """),
+            con,
+            params={
+                "prev_start": prev_start.isoformat(),
+                "max_date": max_dt.isoformat(),
+            },
+        )
 
     if df.empty:
         return pd.DataFrame()
@@ -249,6 +227,7 @@ def _load_emerging_niches(db_url: str, window_days: int = 7) -> pd.DataFrame:
                    median_views_per_day=("views_per_day", "median"),
                )
                .reset_index())
+
         agg["score"] = (
             0.35*np.log10(agg["median_views"] + 1) +
             0.25*np.log10(agg["p90_views"] + 1) +
@@ -272,7 +251,7 @@ def _load_emerging_niches(db_url: str, window_days: int = 7) -> pd.DataFrame:
 
 
 # -----------------------------
-# App
+# App setup
 # -----------------------------
 
 load_dotenv()
@@ -282,16 +261,41 @@ API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 DB_URL = os.getenv("DB_URL", "").strip() or None
 
 st.title("YouTube Shorts Virality Scanner")
-st.caption("Best-practice mode: browse DB snapshots; scan at most once per day (UTC).")
+st.caption("DB-first mode: browse DB snapshots; run scans intentionally to manage quota.")
+
+today_utc = datetime.utcnow().date().isoformat()
 
 def _ensure_urls(videos: pd.DataFrame) -> pd.DataFrame:
     if videos.empty:
         return videos
-    if "video_url" not in videos.columns and "video_id" in videos.columns:
-        videos["video_url"] = "https://www.youtube.com/watch?v=" + videos["video_id"].astype(str)
-    if "channel_url" not in videos.columns and "channel_id" in videos.columns:
-        videos["channel_url"] = "https://www.youtube.com/channel/" + videos["channel_id"].astype(str)
-    return videos
+    out = videos.copy()
+    if "video_url" not in out.columns and "video_id" in out.columns:
+        out["video_url"] = "https://www.youtube.com/watch?v=" + out["video_id"].astype(str)
+    if "channel_url" not in out.columns and "channel_id" in out.columns:
+        out["channel_url"] = "https://www.youtube.com/channel/" + out["channel_id"].astype(str)
+    return out
+
+def _normalize_snapshot_channel_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    scanner.load_latest_snapshot may return channel_* columns from DB join.
+    Normalize them to expected names used by UI and drawer.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    rename_map = {}
+    if "channel_created_at" in out.columns and "created_at" not in out.columns:
+        rename_map["channel_created_at"] = "created_at"
+    if "channel_subscribers" in out.columns and "subscribers" not in out.columns:
+        rename_map["channel_subscribers"] = "subscribers"
+    if "channel_video_count" in out.columns and "video_count" not in out.columns:
+        rename_map["channel_video_count"] = "video_count"
+    if "channel_total_views" in out.columns and "total_views" not in out.columns:
+        rename_map["channel_total_views"] = "total_views"
+    if rename_map:
+        out = out.rename(columns=rename_map)
+    return out
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def _cached_run_scan(budget_kwargs: dict, db_url: Optional[str]):
@@ -308,158 +312,24 @@ def _cached_run_scan(budget_kwargs: dict, db_url: Optional[str]):
 def _cached_load_latest(db_url: str):
     return load_latest_snapshot(db_url)
 
-today_utc = datetime.utcnow().date().isoformat()
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_load_channels_db(db_url: str) -> pd.DataFrame:
+    return load_channels_table(db_url)
 
-with st.sidebar:
-    st.header("Daily Scan Configuration")
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_load_latest_niche_scan(db_url: str, niche: str) -> Tuple[Optional[str], pd.DataFrame]:
+    return load_latest_niche_scan(db_url, niche)
 
-    mode = st.selectbox(
-        "Scan depth",
-        options=["Default (daily)", "Ultra-safe (frequent)", "Deep-scan (weekly)"],
-        index=0
-    )
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_load_niche_runs(db_url: str, niche: Optional[str] = None) -> pd.DataFrame:
+    return load_niche_scan_runs(db_url, niche=niche)
 
-    if mode == "Ultra-safe (frequent)":
-        default_qpn, default_mrp, default_cap = 3, 15, 80
-    elif mode == "Deep-scan (weekly)":
-        default_qpn, default_mrp, default_cap = 6, 35, 180
-    else:
-        default_qpn, default_mrp, default_cap = 5, 25, 120
-
-    scan_days = st.slider("Time window (days)", min_value=7, max_value=90, value=30, step=1)
-    queries_per_niche = st.slider("Queries per niche", 1, 6, default_qpn, 1)
-    max_results_per_query = st.slider("Max results per query", 5, 50, default_mrp, 5)
-    shorts_threshold = st.slider("Shorts score threshold", 0.40, 0.90, 0.60, 0.05)
-    max_videos_per_niche = st.slider("Max videos per niche (post-filter cap)", 40, 250, default_cap, 10)
-
-    st.divider()
-    st.header("Display Filters")
-    min_views = st.number_input("Min views", min_value=0, value=0, step=1000)
-    min_views_per_day = st.number_input("Min views/day", min_value=0.0, value=0.0, step=100.0)
-    only_top_niches = st.slider("Show leaderboard top N", 10, 50, 30, 5)
-
-    st.divider()
-    st.header("Storage & Actions")
-
-    use_db = st.checkbox("Use SQLite persistence (DB_URL)", value=bool(DB_URL))
-
-    db_ready = bool(use_db and DB_URL and _sqlalchemy_available())
-    if use_db and not DB_URL:
-        st.warning("DB_URL not set. Add DB_URL=sqlite:///yt_shorts.db to your .env to enable persistence.")
-    if use_db and DB_URL and not _sqlalchemy_available():
-        st.warning("SQLAlchemy not installed. Run: pip install sqlalchemy")
-
-    # Seed mode for first run or quota-sensitive environments
-    seed_mode = st.checkbox("Seed DB (Ultra-safe, first run)", value=True)
-    st.caption("Seed mode reduces API calls dramatically (recommended until DB has snapshots).")
-
-    already_scanned_today = _has_snapshot_for_date(DB_URL, today_utc) if db_ready else False
-    latest_date = _get_latest_date(DB_URL) if db_ready else None
-
-    run_btn = st.button(
-        f"Run daily scan ({today_utc})",
-        type="primary",
-        disabled=(not db_ready) or already_scanned_today or (API_KEY == "")
-    )
-
-    if not db_ready:
-        st.info("Daily scan mode requires DB_URL + SQLAlchemy (recommended).")
-    elif API_KEY == "":
-        st.warning("YOUTUBE_API_KEY missing. You can still browse existing DB snapshots.")
-    elif already_scanned_today:
-        st.success(f"Daily scan already completed for {today_utc}.")
-    else:
-        st.caption("Scan is allowed once per day. All browsing uses DB snapshots.")
-
-    load_latest_btn = st.button("Reload latest DB snapshot", disabled=(not db_ready))
-
-    st.divider()
-    st.header("About")
-    st.write("Niches:", len(QUERY_PACKS))
-    st.write("DB persistence:", "Enabled" if db_ready else "Disabled")
-    if latest_date:
-        st.write("Latest snapshot date:", latest_date)
-
-# Base budget
-budget_kwargs = dict(
-    queries_per_niche=queries_per_niche,
-    max_results_per_query=max_results_per_query,
-    scan_days=scan_days,
-    shorts_score_threshold=shorts_threshold,
-    max_videos_per_niche=max_videos_per_niche,
-)
-
-# Apply seed-mode budget override (ultra conservative)
-effective_budget_kwargs = dict(budget_kwargs)
-if seed_mode:
-    effective_budget_kwargs["queries_per_niche"] = 1
-    effective_budget_kwargs["max_results_per_query"] = min(int(effective_budget_kwargs["max_results_per_query"]), 15)
-    effective_budget_kwargs["max_videos_per_niche"] = min(int(effective_budget_kwargs["max_videos_per_niche"]), 60)
 
 # -----------------------------
-# Core data flow (DB-first)
+# Drawer renderer (sidebar)
 # -----------------------------
 
-videos = pd.DataFrame()
-channels = pd.DataFrame()
-data_source_label = "None"
-
-def _load_db_or_empty() -> pd.DataFrame:
-    if not db_ready:
-        return pd.DataFrame()
-    try:
-        snap = _cached_load_latest(DB_URL)
-        return snap if isinstance(snap, pd.DataFrame) else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-def _load_channels_db_or_empty() -> pd.DataFrame:
-    if not db_ready:
-        return pd.DataFrame()
-    try:
-        df = _cached_load_channels_from_db(DB_URL)
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-def _render_empty_db_quota_message(e: Exception) -> None:
-    st.error(
-        "YouTube API quota is exceeded and the database is empty, so there is no snapshot to display.\n\n"
-        "How to fix:\n"
-        "1) Wait for quota to reset, then click 'Run daily scan' once to seed the database.\n"
-        "2) Keep 'Seed DB (Ultra-safe, first run)' enabled to minimize quota usage.\n"
-        "3) Or request higher quota in Google Cloud Console.\n\n"
-        "After the first successful scan, the UI will always work from DB snapshots—even when quota is exhausted.\n\n"
-        f"Details: {e}"
-    )
-
-def _normalize_snapshot_channel_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    scanner.load_latest_snapshot may return channel_* columns from DB join.
-    Normalize them to expected names used by UI and drawer.
-    """
-    if df is None or df.empty:
-        return df
-
-    out = df.copy()
-    rename_map = {}
-
-    if "channel_created_at" in out.columns and "created_at" not in out.columns:
-        rename_map["channel_created_at"] = "created_at"
-    if "channel_subscribers" in out.columns and "subscribers" not in out.columns:
-        rename_map["channel_subscribers"] = "subscribers"
-    if "channel_video_count" in out.columns and "video_count" not in out.columns:
-        rename_map["channel_video_count"] = "video_count"
-    if "channel_total_views" in out.columns and "total_views" not in out.columns:
-        rename_map["channel_total_views"] = "total_views"
-
-    if rename_map:
-        out = out.rename(columns=rename_map)
-
-    return out
-
-# Drawer renderer
-def _render_channel_profile_drawer(
+def _render_channel_profile_sidebar(
     selected_channel_id: str,
     videos_df: pd.DataFrame,
     channels_df: pd.DataFrame,
@@ -469,7 +339,7 @@ def _render_channel_profile_drawer(
         st.info("Select a channel to view its profile.")
         return
 
-    vch = videos_df[videos_df["channel_id"] == selected_channel_id].copy() if not videos_df.empty else pd.DataFrame()
+    vch = videos_df[videos_df["channel_id"] == selected_channel_id].copy() if (not videos_df.empty and "channel_id" in videos_df.columns) else pd.DataFrame()
     chrow = pd.DataFrame()
     if channels_df is not None and not channels_df.empty and "channel_id" in channels_df.columns:
         chrow = channels_df[channels_df["channel_id"] == selected_channel_id].head(1)
@@ -520,7 +390,6 @@ def _render_channel_profile_drawer(
     s3.metric("Sampled views (median)", f"{int(sampled_views_med):,}")
     s4.metric("Sampled views/day (median)", f"{int(sampled_vpd_med):,}")
 
-    # top niches in sample
     if "niche" in vch.columns and not vch["niche"].isna().all():
         niche_counts = (vch["niche"].value_counts().head(10).reset_index())
         niche_counts.columns = ["niche", "shorts_in_sample"]
@@ -532,21 +401,177 @@ def _render_channel_profile_drawer(
     if sort_key:
         vch = vch.sort_values(sort_key, ascending=False)
 
-    cols = [c for c in [
-        "niche", "title", "views", "views_per_day", "shorts_score", "published_at", "video_url"
-    ] if c in vch.columns]
-
+    cols = [c for c in ["niche", "title", "views", "views_per_day", "shorts_score", "published_at", "video_url"] if c in vch.columns]
     st.dataframe(vch[cols].head(25), use_container_width=True, height=420)
 
-# Run/load logic
+
+# -----------------------------
+# Sidebar: controls + persistent profile
+# -----------------------------
+
+with st.sidebar:
+    st.header("Storage & Mode")
+
+    use_db = st.checkbox("Use SQLite persistence (DB_URL)", value=bool(DB_URL))
+    db_ready = bool(use_db and DB_URL and _sqlalchemy_available())
+
+    if use_db and not DB_URL:
+        st.warning("DB_URL not set. Add DB_URL=sqlite:///yt_shorts.db to your .env to enable persistence.")
+    if use_db and DB_URL and not _sqlalchemy_available():
+        st.warning("SQLAlchemy not installed. Run: pip install sqlalchemy")
+
+    st.divider()
+    st.header("Daily Scan (global)")
+
+    mode = st.selectbox(
+        "Scan depth",
+        options=["Default (daily)", "Ultra-safe (frequent)", "Deep-scan (weekly)"],
+        index=0
+    )
+
+    if mode == "Ultra-safe (frequent)":
+        default_qpn, default_mrp, default_cap = 3, 15, 80
+    elif mode == "Deep-scan (weekly)":
+        default_qpn, default_mrp, default_cap = 6, 35, 180
+    else:
+        default_qpn, default_mrp, default_cap = 5, 25, 120
+
+    scan_days = st.slider("Time window (days)", min_value=7, max_value=90, value=30, step=1)
+    queries_per_niche = st.slider("Queries per niche", 1, 6, default_qpn, 1)
+    max_results_per_query = st.slider("Max results per query", 5, 50, default_mrp, 5)
+    shorts_threshold = st.slider("Shorts score threshold", 0.40, 0.90, 0.60, 0.05)
+    max_videos_per_niche = st.slider("Max videos per niche (post-filter cap)", 40, 250, default_cap, 10)
+
+    seed_mode = st.checkbox("Seed DB (Ultra-safe, first run)", value=True)
+    st.caption("Seed mode reduces API calls dramatically (recommended until DB has snapshots).")
+
+    already_scanned_today = _has_snapshot_for_date(DB_URL, today_utc) if db_ready else False
+    latest_date = _get_latest_date(DB_URL) if db_ready else None
+
+    run_btn = st.button(
+        f"Run daily scan ({today_utc})",
+        type="primary",
+        disabled=(not db_ready) or already_scanned_today or (API_KEY == "")
+    )
+
+    if not db_ready:
+        st.info("Daily scan requires DB_URL + SQLAlchemy.")
+    elif API_KEY == "":
+        st.warning("YOUTUBE_API_KEY missing. You can still browse existing DB snapshots.")
+    elif already_scanned_today:
+        st.success(f"Daily scan already completed for {today_utc}.")
+    else:
+        st.caption("Scan is allowed once per UTC day.")
+
+    load_latest_btn = st.button("Reload latest DB snapshot", disabled=(not db_ready))
+
+    st.divider()
+    st.header("Niche Deep Scan (API)")
+
+    niche_list = sorted(list(QUERY_PACKS.keys()))
+    selected_deep_niche = st.selectbox("Pick a niche", options=niche_list, index=0)
+
+    deep_scan_days = st.slider("Deep scan window (days)", 7, 180, 45, 1)
+    deep_queries_per_niche = st.slider("Deep scan: queries per niche", 1, 6, 3, 1)
+    deep_max_results_per_query = st.slider("Deep scan: max results/query", 5, 50, 25, 5)
+    deep_shorts_threshold = st.slider("Deep scan: shorts threshold", 0.40, 0.90, 0.60, 0.05)
+    deep_max_videos_per_niche = st.slider("Deep scan: max videos (post-filter cap)", 40, 400, 200, 10)
+
+    run_deep_btn = st.button(
+        "Run niche deep scan (API)",
+        type="primary",
+        disabled=(not db_ready) or (API_KEY == "")
+    )
+
+    st.caption("Deep scans are niche-specific and can run multiple times (until quota is exhausted).")
+
+    st.divider()
+    st.header("Display Filters")
+    min_views = st.number_input("Min views", min_value=0, value=0, step=1000)
+    min_views_per_day = st.number_input("Min views/day", min_value=0.0, value=0.0, step=100.0)
+    only_top_niches = st.slider("Show leaderboard top N", 10, 50, 30, 5)
+
+    st.divider()
+    st.header("Channel Profile (persistent)")
+
+    if "selected_channel_id" not in st.session_state:
+        st.session_state["selected_channel_id"] = ""
+
+    st.caption("Select a channel in Channels Explorer or Niche Deep Dive, then it persists here while you scroll.")
+
+
+# -----------------------------
+# Budgets
+# -----------------------------
+
+budget_kwargs = dict(
+    queries_per_niche=queries_per_niche,
+    max_results_per_query=max_results_per_query,
+    scan_days=scan_days,
+    shorts_score_threshold=shorts_threshold,
+    max_videos_per_niche=max_videos_per_niche,
+)
+
+effective_budget_kwargs = dict(budget_kwargs)
+if seed_mode:
+    effective_budget_kwargs["queries_per_niche"] = 1
+    effective_budget_kwargs["max_results_per_query"] = min(int(effective_budget_kwargs["max_results_per_query"]), 15)
+    effective_budget_kwargs["max_videos_per_niche"] = min(int(effective_budget_kwargs["max_videos_per_niche"]), 60)
+
+deep_budget = ScanBudget(
+    queries_per_niche=int(deep_queries_per_niche),
+    max_results_per_query=int(deep_max_results_per_query),
+    scan_days=int(deep_scan_days),
+    shorts_score_threshold=float(deep_shorts_threshold),
+    max_videos_per_niche=int(deep_max_videos_per_niche),
+)
+
+
+# -----------------------------
+# Core data flow (DB-first global snapshot)
+# -----------------------------
+
+videos = pd.DataFrame()
+channels = pd.DataFrame()
+data_source_label = "None"
+
+def _load_db_or_empty() -> pd.DataFrame:
+    if not db_ready:
+        return pd.DataFrame()
+    try:
+        snap = _cached_load_latest(DB_URL)
+        return snap if isinstance(snap, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _load_channels_db_or_empty() -> pd.DataFrame:
+    if not db_ready:
+        return pd.DataFrame()
+    try:
+        df = _cached_load_channels_db(DB_URL)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _render_empty_db_quota_message(e: Exception) -> None:
+    st.error(
+        "YouTube API quota is exceeded and the database is empty, so there is no snapshot to display.\n\n"
+        "How to fix:\n"
+        "1) Wait for quota to reset, then click 'Run daily scan' once to seed the database.\n"
+        "2) Keep 'Seed DB (Ultra-safe, first run)' enabled to minimize quota usage.\n"
+        "3) Or request higher quota in Google Cloud Console.\n\n"
+        "After the first successful scan, the UI will always work from DB snapshots—even when quota is exhausted.\n\n"
+        f"Details: {e}"
+    )
+
+# Run daily global scan
 if run_btn:
     st.cache_data.clear()
     if not db_ready:
         st.error("DB is not ready. Enable DB_URL + SQLAlchemy to run daily scans.")
     elif _has_snapshot_for_date(DB_URL, today_utc):
         st.info(f"Daily scan already ran for {today_utc}. Loading DB snapshot.")
-        snap = _load_db_or_empty()
-        snap = _normalize_snapshot_channel_cols(snap)
+        snap = _normalize_snapshot_channel_cols(_load_db_or_empty())
         videos = _ensure_urls(snap)
         channels = _load_channels_db_or_empty()
         data_source_label = "SQLite snapshot"
@@ -554,7 +579,7 @@ if run_btn:
         with st.spinner("Running daily scan (YouTube API) and persisting to DB..."):
             try:
                 v, c = _cached_run_scan(effective_budget_kwargs, DB_URL)
-                videos, channels = _ensure_urls(v), c
+                videos, channels = _ensure_urls(v), (c if isinstance(c, pd.DataFrame) else pd.DataFrame())
                 data_source_label = "Live scan"
                 st.success(f"Daily scan completed and stored for {today_utc}.")
             except Exception as e:
@@ -587,7 +612,6 @@ elif load_latest_btn:
             data_source_label = "SQLite snapshot"
 
 else:
-    # Default: always use DB snapshot (no scanning on page load)
     snap = _load_db_or_empty()
     if not db_ready:
         st.warning("DB persistence is disabled. Enable DB_URL + SQLAlchemy to keep the UI usable without API quota.")
@@ -602,6 +626,62 @@ else:
         channels = _load_channels_db_or_empty()
         data_source_label = "SQLite snapshot"
 
+
+# -----------------------------
+# Niche deep scan (API) trigger + DB-first loader
+# -----------------------------
+
+deep_run_id: Optional[str] = None
+deep_videos = pd.DataFrame()
+
+if run_deep_btn:
+    st.cache_data.clear()
+    if not db_ready:
+        st.error("DB is not ready. Enable DB_URL + SQLAlchemy to run niche deep scans.")
+    elif API_KEY == "":
+        st.error("Missing YOUTUBE_API_KEY. Cannot run niche deep scan.")
+    else:
+        with st.spinner(f"Running niche deep scan for '{selected_deep_niche}' and persisting to DB..."):
+            try:
+                v, c, rid = run_niche_scan(
+                    api_key=API_KEY,
+                    niche=selected_deep_niche,
+                    queries=QUERY_PACKS.get(selected_deep_niche, []),
+                    budget=deep_budget,
+                    db_url=DB_URL,
+                )
+                deep_run_id = rid
+                deep_videos = _ensure_urls(_normalize_snapshot_channel_cols(v))
+                channels = _load_channels_db_or_empty()
+                st.success(f"Niche deep scan completed for '{selected_deep_niche}'. run_id={rid}")
+            except Exception as e:
+                st.error(f"Niche deep scan failed (likely quota/API issue).\n\nDetails: {e}")
+
+# Always attempt to load latest deep scan for the selected niche (DB-first)
+if db_ready and selected_deep_niche:
+    rid2, df2 = _cached_load_latest_niche_scan(DB_URL, selected_deep_niche)
+    if rid2 and isinstance(df2, pd.DataFrame) and not df2.empty:
+        deep_run_id = rid2
+        deep_videos = _ensure_urls(_normalize_snapshot_channel_cols(df2))
+
+
+# -----------------------------
+# Sidebar: render persistent channel profile based on ACTIVE dataset
+# -----------------------------
+
+active_videos_for_profile = deep_videos if (deep_videos is not None and not deep_videos.empty) else videos
+active_channels_for_profile = channels if (channels is not None and not channels.empty) else _load_channels_db_or_empty()
+
+with st.sidebar:
+    st.divider()
+    _render_channel_profile_sidebar(
+        selected_channel_id=st.session_state.get("selected_channel_id", ""),
+        videos_df=active_videos_for_profile if isinstance(active_videos_for_profile, pd.DataFrame) else pd.DataFrame(),
+        channels_df=active_channels_for_profile if isinstance(active_channels_for_profile, pd.DataFrame) else pd.DataFrame(),
+        title="Channel Profile",
+    )
+
+
 # -----------------------------
 # Header stats
 # -----------------------------
@@ -614,8 +694,9 @@ colD.metric("Data source", data_source_label)
 
 st.divider()
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["Niche Leaderboard", "Videos Explorer", "Channels Explorer", "Emerging Niches"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Niche Leaderboard", "Videos Explorer", "Channels Explorer", "Emerging Niches", "Niche Deep Dive"]
+)
 
 # -----------------------------
 # Tab 1: Leaderboard
@@ -654,7 +735,11 @@ with tab2:
         if "views_per_day" in vf.columns:
             vf = vf[vf["views_per_day"] >= float(min_views_per_day)]
 
-        sort_by = st.selectbox("Sort videos by", options=["views", "views_per_day", "shorts_score", "published_at"], index=0)
+        sort_by = st.selectbox(
+            "Sort videos by",
+            options=[c for c in ["views", "views_per_day", "shorts_score", "published_at"] if c in vf.columns],
+            index=0
+        )
         ascending = st.checkbox("Ascending sort", value=False)
 
         if sort_by in vf.columns:
@@ -670,7 +755,7 @@ with tab2:
         st.caption("Copy/paste video_url or channel_url into your browser.")
 
 # -----------------------------
-# Tab 3: Channels Explorer + Channel Profile drawer
+# Tab 3: Channels Explorer (selection drives sidebar profile)
 # -----------------------------
 with tab3:
     st.subheader("Channels Explorer")
@@ -678,18 +763,7 @@ with tab3:
     if videos.empty:
         st.info("No channels available.")
     else:
-        # Build a channels metadata table for enrichment:
-        # - prefer DB channels table (DB-first), but live scan channels also works.
         channels_df = channels.copy() if (channels is not None and not channels.empty) else _load_channels_db_or_empty()
-
-        # If snapshot already includes channel columns, optionally back-fill channels_df from snapshot
-        # (helps if channels table isn't populated for older DBs)
-        if (channels_df is None or channels_df.empty) and not videos.empty:
-            possible = ["channel_id", "channel_title", "created_at", "subscribers", "video_count", "total_views"]
-            if all(c in videos.columns for c in ["channel_id", "channel_title"]) and any(c in videos.columns for c in possible[2:]):
-                channels_df = (videos[possible]
-                               .drop_duplicates("channel_id")
-                               .rename(columns={"channel_title": "channel_title"}))
 
         ct = _channel_table(videos, channels_df)
 
@@ -702,10 +776,7 @@ with tab3:
 
         ch_sort = st.selectbox(
             "Sort channels by",
-            options=[
-                "sample_views_sum", "shorts_in_sample", "sample_views_median",
-                "subscribers", "total_views", "video_count"
-            ],
+            options=[c for c in ["sample_views_sum", "shorts_in_sample", "sample_views_median", "subscribers", "total_views", "video_count"] if c in cf.columns],
             index=0
         )
         ch_asc = st.checkbox("Ascending (channels)", value=False)
@@ -713,42 +784,35 @@ with tab3:
         if ch_sort in cf.columns:
             cf = cf.sort_values(ch_sort, ascending=ch_asc)
 
-        left, right = st.columns([1.4, 1.0], gap="large")
+        st.markdown("**Channel list (sample-based)**")
+        preferred_cols = [
+            "niche", "channel_title",
+            "subscribers", "total_views", "video_count", "created_at",
+            "shorts_in_sample", "sample_views_sum", "sample_views_median",
+            "channel_id"
+        ]
+        show_cols = [c for c in preferred_cols if c in cf.columns]
+        st.dataframe(cf[show_cols], use_container_width=True, height=520)
 
-        with left:
-            st.markdown("**Channel list (sample-based)**")
-            preferred_cols = [
-                "niche", "channel_title",
-                "subscribers", "total_views", "video_count", "created_at",
-                "shorts_in_sample", "sample_views_sum", "sample_views_median",
-                "channel_id"
+        st.divider()
+        st.markdown("**Select a channel to pin to the sidebar profile**")
+
+        channel_options = []
+        if not cf.empty and "channel_id" in cf.columns and "channel_title" in cf.columns:
+            channel_options = [
+                f"{r['channel_title']} | {r['channel_id']}"
+                for _, r in cf[["channel_title", "channel_id"]].drop_duplicates().head(300).iterrows()
             ]
-            show_cols = [c for c in preferred_cols if c in cf.columns]
-            st.dataframe(cf[show_cols], use_container_width=True, height=520)
 
-        with right:
-            st.markdown("**Channel Profile**")
+        selected = st.selectbox(
+            "Channel (pins profile in sidebar)",
+            options=["(Select)"] + channel_options,
+            key="pin_channel_select_global"
+        )
 
-            channel_options = []
-            if not cf.empty and "channel_id" in cf.columns and "channel_title" in cf.columns:
-                channel_options = [
-                    f"{r['channel_title']} | {r['channel_id']}"
-                    for _, r in cf[["channel_title", "channel_id"]].drop_duplicates().head(200).iterrows()
-                ]
-
-            selected = st.selectbox("Select a channel", options=["(Select)"] + channel_options)
-
-            if selected != "(Select)":
-                selected_channel_id = selected.split("|")[-1].strip()
-                with st.expander("Open drawer", expanded=True):
-                    _render_channel_profile_drawer(
-                        selected_channel_id=selected_channel_id,
-                        videos_df=videos,
-                        channels_df=channels_df if channels_df is not None else pd.DataFrame(),
-                        title="Channel Profile",
-                    )
-            else:
-                st.info("Pick a channel to view creation date, subscribers, total views, uploads, and top Shorts.")
+        if selected != "(Select)":
+            st.session_state["selected_channel_id"] = selected.split("|")[-1].strip()
+            st.success("Pinned. Scroll anywhere—the profile stays in the sidebar.")
 
 # -----------------------------
 # Tab 4: Emerging niches
@@ -776,14 +840,73 @@ with tab4:
                 height=420
             )
 
+# -----------------------------
+# Tab 5: Niche Deep Dive (DB-first + optional API)
+# -----------------------------
+with tab5:
+    st.subheader("Niche Deep Dive")
+
+    if not db_ready:
+        st.info("Enable DB_URL + SQLAlchemy to use niche deep dive (DB-first).")
+    else:
+        st.write(f"Selected niche: **{selected_deep_niche}**")
+        if deep_run_id:
+            st.caption(f"Latest deep scan run_id: {deep_run_id}")
+        else:
+            st.caption("No deep scan found yet for this niche. Use the sidebar to run one (API).")
+
+        runs = _cached_load_niche_runs(DB_URL, niche=selected_deep_niche)
+        if runs is not None and not runs.empty:
+            st.markdown("**Deep scan run history**")
+            st.dataframe(runs, use_container_width=True, height=220)
+
+        if deep_videos is None or deep_videos.empty:
+            st.info("No niche deep scan results available yet.")
+        else:
+            df = deep_videos.copy()
+            if "views" in df.columns:
+                df = df[df["views"] >= int(min_views)]
+            if "views_per_day" in df.columns:
+                df = df[df["views_per_day"] >= float(min_views_per_day)]
+
+            sort_by = st.selectbox(
+                "Sort deep scan videos by",
+                options=[c for c in ["views_per_day", "views", "shorts_score", "published_at"] if c in df.columns],
+                index=0,
+                key="deep_sort"
+            )
+            asc = st.checkbox("Ascending (deep)", value=False, key="deep_asc")
+            if sort_by in df.columns:
+                df = df.sort_values(sort_by, ascending=asc)
+
+            st.markdown("**Viral Shorts (niche deep scan)**")
+            cols = [c for c in [
+                "title", "channel_title", "views", "views_per_day", "shorts_score",
+                "published_at", "video_url", "channel_url",
+                "source_query",
+                "created_at", "subscribers", "video_count", "total_views",
+            ] if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, height=520)
+
+            st.divider()
+            st.markdown("**Pin a channel from deep scan to sidebar profile**")
+            if "channel_id" in df.columns and "channel_title" in df.columns:
+                channel_options = [
+                    f"{r['channel_title']} | {r['channel_id']}"
+                    for _, r in df[["channel_title", "channel_id"]].drop_duplicates().head(300).iterrows()
+                ]
+                sel = st.selectbox("Channel (deep scan)", options=["(Select)"] + channel_options, key="pin_channel_select_deep")
+                if sel != "(Select)":
+                    st.session_state["selected_channel_id"] = sel.split("|")[-1].strip()
+                    st.success("Pinned. The profile stays visible in the sidebar.")
+
 st.divider()
 with st.expander("Operational notes (API & quotas)"):
     st.write(
         f"""
-- This UI is DB-first: it loads saved snapshots and does not consume API quota while browsing.
-- Daily scans are allowed once per UTC day ({today_utc}). After that, the scan button is disabled.
-- If a scan fails due to quota/API limits, the UI automatically falls back to the latest DB snapshot.
-- If the DB is empty and quota is exceeded, keep Seed DB mode enabled and run once after quota resets.
-- Channels Explorer includes a Channel Profile drawer (right panel) with channel metadata + top sampled Shorts.
+- DB-first browsing: opening the app does not call the YouTube API.
+- Global daily scan is limited to once per UTC day ({today_utc}).
+- Niche deep scans are on-demand (until quota is exhausted) and persist separately in DB.
+- Channel Profile persists in the sidebar and updates when you “pin” a channel.
         """
     )

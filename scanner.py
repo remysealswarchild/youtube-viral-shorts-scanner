@@ -15,11 +15,27 @@
 #     - total channel views (statistics.viewCount)
 # - DB schema updated to persist expanded channel metadata
 # - Snapshot loader joins in channel metadata for DB-first UI (channel drawer + tables)
+#
+# NEW (per your latest request: niche-specific API deep scan):
+# - Adds "niche deep scan" persistence that does NOT conflict with daily global snapshot:
+#     - niche_scan_runs: run-level metadata (one row per deep scan execution)
+#     - niche_video_stats_daily: per-video metrics keyed by (video_id, date, niche)
+# - Adds APIs for app.py:
+#     - run_niche_scan(...)
+#     - load_latest_niche_scan(db_url, niche)
+#     - load_niche_scan_runs(db_url, niche=None)
+#     - load_channels_table(db_url)
+#
+# Notes:
+# - Global daily snapshots continue to write to video_stats_daily with PK(video_id, date).
+# - Niche deep scans write to niche_video_stats_daily with PK(video_id, date, niche),
+#   so you can run multiple niche scans per day without clobbering global or other niches.
 
 from __future__ import annotations
 
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
 from typing import Dict, List, Tuple, Optional
@@ -53,13 +69,12 @@ def _http_error_text(e: HttpError) -> str:
 def _is_quota_error(e: HttpError) -> bool:
     """
     Detect quota/rate-limit issues that should trigger UI fallback to DB.
-    Note: some quota errors appear as 403 with reason quotaExceeded / userRateLimitExceeded.
+    Some quota errors appear as 403 with reason quotaExceeded / userRateLimitExceeded.
     """
     msg = _http_error_text(e)
     tokens = ("quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded")
     if any(t in msg for t in tokens):
         return True
-    # HttpError has status_code on newer googleapiclient; otherwise parse string.
     if getattr(e, "status_code", None) == 403:
         return True
     if "HttpError 403" in msg:
@@ -130,9 +145,12 @@ def _get_engine(db_url: str):
 def _init_db(engine):
     """
     Create tables (if not exist) and indices.
-    If your DB was created before channel schema expansion, you may need ALTER TABLE or recreate DB.
+
+    If your DB was created before channel schema expansion, SQLite will not auto-migrate.
+    Best practice: delete the old yt_shorts.db and let it recreate, OR add manual ALTER TABLE.
     """
     with engine.begin() as con:
+        # Videos table
         con.execute(text("""
         CREATE TABLE IF NOT EXISTS videos (
             video_id TEXT PRIMARY KEY,
@@ -145,11 +163,7 @@ def _init_db(engine):
         );
         """))
 
-        # Expanded channel metadata:
-        # - created_at: channel creation time (snippet.publishedAt)
-        # - subscribers: subscriberCount (may be hidden)
-        # - video_count: total uploads count
-        # - total_views: channel viewCount
+        # Expanded channel metadata
         con.execute(text("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -162,6 +176,7 @@ def _init_db(engine):
         );
         """))
 
+        # Daily global snapshot stats
         con.execute(text("""
         CREATE TABLE IF NOT EXISTS video_stats_daily (
             video_id TEXT,
@@ -175,12 +190,51 @@ def _init_db(engine):
         );
         """))
 
+        # NEW: Niche deep scan run metadata
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS niche_scan_runs (
+            run_id TEXT PRIMARY KEY,
+            niche TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            scan_days INTEGER,
+            queries_per_niche INTEGER,
+            max_results_per_query INTEGER,
+            shorts_score_threshold REAL,
+            max_videos_per_niche INTEGER,
+            status TEXT,
+            error TEXT
+        );
+        """))
+
+        # NEW: Niche deep scan per-video stats (allows multiple niches per day)
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS niche_video_stats_daily (
+            run_id TEXT,
+            video_id TEXT,
+            date TEXT,
+            niche TEXT,
+            views INTEGER,
+            views_per_day REAL,
+            shorts_score REAL,
+            source_query TEXT,
+            PRIMARY KEY (video_id, date, niche)
+        );
+        """))
+
         # Indices for faster UI queries
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_date ON video_stats_daily(date);"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_niche ON video_stats_daily(niche);"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_stats_video ON video_stats_daily(video_id);"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id);"))
         con.execute(text("CREATE INDEX IF NOT EXISTS idx_channels_updated ON channels(updated_at);"))
+
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_runs_niche ON niche_scan_runs(niche);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_runs_started ON niche_scan_runs(started_at);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_stats_date ON niche_video_stats_daily(date);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_stats_niche ON niche_video_stats_daily(niche);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_stats_run ON niche_video_stats_daily(run_id);"))
+        con.execute(text("CREATE INDEX IF NOT EXISTS idx_niche_stats_video ON niche_video_stats_daily(video_id);"))
 
 def _upsert_videos(engine, df: pd.DataFrame):
     if df.empty:
@@ -247,12 +301,61 @@ def _insert_daily_stats(engine, df_stats: pd.DataFrame):
             VALUES(:video_id,:date,:views,:views_per_day,:niche,:shorts_score,:source_query)
             """), r.to_dict())
 
+def _insert_niche_run(engine, run_row: dict):
+    with engine.begin() as con:
+        con.execute(text("""
+        INSERT INTO niche_scan_runs(
+            run_id,niche,started_at,finished_at,scan_days,queries_per_niche,max_results_per_query,
+            shorts_score_threshold,max_videos_per_niche,status,error
+        ) VALUES (
+            :run_id,:niche,:started_at,:finished_at,:scan_days,:queries_per_niche,:max_results_per_query,
+            :shorts_score_threshold,:max_videos_per_niche,:status,:error
+        )
+        ON CONFLICT(run_id) DO UPDATE SET
+            niche=excluded.niche,
+            started_at=excluded.started_at,
+            finished_at=excluded.finished_at,
+            scan_days=excluded.scan_days,
+            queries_per_niche=excluded.queries_per_niche,
+            max_results_per_query=excluded.max_results_per_query,
+            shorts_score_threshold=excluded.shorts_score_threshold,
+            max_videos_per_niche=excluded.max_videos_per_niche,
+            status=excluded.status,
+            error=excluded.error
+        """), run_row)
+
+def _insert_niche_stats_daily(engine, df_stats: pd.DataFrame):
+    """
+    Expected columns:
+      run_id, video_id, date, niche, views, views_per_day, shorts_score, source_query
+    PK: (video_id, date, niche) so the same video can be stored for multiple niches per day.
+    """
+    if df_stats.empty:
+        return
+
+    cols = ["run_id", "video_id", "date", "niche", "views", "views_per_day", "shorts_score", "source_query"]
+    df_stats = df_stats[cols].copy()
+    df_stats["views"] = pd.to_numeric(df_stats["views"], errors="coerce").fillna(0).astype(int)
+    df_stats["views_per_day"] = pd.to_numeric(df_stats["views_per_day"], errors="coerce").fillna(0.0).astype(float)
+    df_stats["shorts_score"] = pd.to_numeric(df_stats["shorts_score"], errors="coerce").fillna(0.0).astype(float)
+
+    with engine.begin() as con:
+        for _, r in df_stats.iterrows():
+            con.execute(text("""
+            INSERT OR IGNORE INTO niche_video_stats_daily(
+                run_id, video_id, date, niche, views, views_per_day, shorts_score, source_query
+            ) VALUES (
+                :run_id, :video_id, :date, :niche, :views, :views_per_day, :shorts_score, :source_query
+            )
+            """), r.to_dict())
+
+
 def load_latest_snapshot(db_url: str) -> pd.DataFrame:
     """
-    Load the latest daily snapshot (max date) joined with video + channel metadata.
+    Load the latest daily global snapshot (max date) joined with video + channel metadata.
     Returns empty DataFrame if no DB or no data.
 
-    This is used by DB-first UI and the Channel Profile drawer.
+    Used by DB-first UI and the Channel Profile drawer.
     """
     if not db_url or not SQLALCHEMY_AVAILABLE:
         return pd.DataFrame()
@@ -267,7 +370,6 @@ def load_latest_snapshot(db_url: str) -> pd.DataFrame:
         if not max_date:
             return pd.DataFrame()
 
-        # Join videos and channels to enrich snapshot rows.
         df = pd.read_sql(text("""
             SELECT
                 s.video_id,
@@ -296,6 +398,120 @@ def load_latest_snapshot(db_url: str) -> pd.DataFrame:
         """), con, params={"d": max_date})
 
     return df
+
+def load_channels_table(db_url: str) -> pd.DataFrame:
+    """
+    Loads channel metadata from DB for UI (channel drawer, channel tables).
+    """
+    if not db_url or not SQLALCHEMY_AVAILABLE:
+        return pd.DataFrame()
+
+    engine = _get_engine(db_url)
+    with engine.begin() as con:
+        try:
+            df = pd.read_sql(text("""
+                SELECT channel_id, channel_title, created_at, subscribers, video_count, total_views, updated_at
+                FROM channels
+            """), con)
+        except OperationalError:
+            return pd.DataFrame()
+
+    return df
+
+
+# -----------------------------
+# Niche deep scan DB loaders
+# -----------------------------
+
+def load_niche_scan_runs(db_url: str, niche: Optional[str] = None) -> pd.DataFrame:
+    """
+    Returns a table of niche scan runs (latest first).
+    """
+    if not db_url or not SQLALCHEMY_AVAILABLE:
+        return pd.DataFrame()
+
+    engine = _get_engine(db_url)
+    with engine.begin() as con:
+        try:
+            if niche:
+                df = pd.read_sql(text("""
+                    SELECT run_id, niche, started_at, finished_at, status, error,
+                           scan_days, queries_per_niche, max_results_per_query,
+                           shorts_score_threshold, max_videos_per_niche
+                    FROM niche_scan_runs
+                    WHERE niche = :n
+                    ORDER BY started_at DESC
+                """), con, params={"n": niche})
+            else:
+                df = pd.read_sql(text("""
+                    SELECT run_id, niche, started_at, finished_at, status, error,
+                           scan_days, queries_per_niche, max_results_per_query,
+                           shorts_score_threshold, max_videos_per_niche
+                    FROM niche_scan_runs
+                    ORDER BY started_at DESC
+                """), con)
+        except OperationalError:
+            return pd.DataFrame()
+
+    return df
+
+def load_latest_niche_scan(db_url: str, niche: str) -> Tuple[Optional[str], pd.DataFrame]:
+    """
+    Loads the latest niche deep scan for a given niche.
+    Returns (run_id, df). If none exists: (None, empty_df)
+    """
+    if not db_url or not SQLALCHEMY_AVAILABLE:
+        return None, pd.DataFrame()
+
+    engine = _get_engine(db_url)
+    with engine.begin() as con:
+        try:
+            run_id = con.execute(
+                text("""
+                    SELECT run_id
+                    FROM niche_scan_runs
+                    WHERE niche = :n AND status = 'success'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"n": niche},
+            ).scalar()
+        except OperationalError:
+            return None, pd.DataFrame()
+
+        if not run_id:
+            return None, pd.DataFrame()
+
+        # Join niche stats -> videos -> channels for a rich UI table
+        df = pd.read_sql(text("""
+            SELECT
+                ns.run_id,
+                ns.video_id,
+                ns.date,
+                ns.niche,
+                ns.views,
+                ns.views_per_day,
+                ns.shorts_score,
+                ns.source_query,
+
+                v.title,
+                v.description,
+                v.channel_id,
+                v.channel_title,
+                v.published_at,
+                v.duration_s,
+
+                c.created_at AS channel_created_at,
+                c.subscribers AS channel_subscribers,
+                c.video_count AS channel_video_count,
+                c.total_views AS channel_total_views
+            FROM niche_video_stats_daily ns
+            JOIN videos v ON v.video_id = ns.video_id
+            LEFT JOIN channels c ON c.channel_id = v.channel_id
+            WHERE ns.run_id = :rid
+        """), con, params={"rid": run_id})
+
+    return str(run_id), df
 
 
 # -----------------------------
@@ -458,7 +674,78 @@ class ScanBudget:
 
 
 # -----------------------------
-# Main entry point
+# Core scan logic helper (reused)
+# -----------------------------
+
+def _scan_one_niche(
+    youtube,
+    niche: str,
+    queries: List[str],
+    budget: ScanBudget,
+    published_after: str,
+) -> pd.DataFrame:
+    """
+    Scans a single niche and returns a videos DF (not persisted here).
+    Quota errors bubble up (HttpError).
+    """
+    if not queries:
+        return pd.DataFrame()
+
+    qlist = queries[: budget.queries_per_niche]
+
+    found_by: Dict[str, str] = {}
+    niche_video_ids: List[str] = []
+
+    for q in qlist:
+        ids = fetch_candidates(
+            youtube,
+            query=q,
+            published_after_iso=published_after,
+            max_results=budget.max_results_per_query,
+        )
+        for vid in ids:
+            if vid in found_by:
+                continue
+            found_by[vid] = q
+            niche_video_ids.append(vid)
+
+    if not niche_video_ids:
+        return pd.DataFrame()
+
+    dfv = fetch_videos(youtube, niche_video_ids)
+    if dfv.empty:
+        return pd.DataFrame()
+
+    dfv["niche"] = niche
+    dfv["source_query"] = dfv["video_id"].map(found_by)
+
+    dfv["shorts_score"] = dfv.apply(
+        lambda r: shorts_confidence(
+            int(r.get("duration_s", 0) or 0),
+            r.get("title"),
+            r.get("description"),
+            r.get("source_query"),
+        ),
+        axis=1,
+    )
+
+    dfv = dfv[dfv["shorts_score"] >= budget.shorts_score_threshold].copy()
+    if dfv.empty:
+        return pd.DataFrame()
+
+    dfv = dfv.sort_values("views", ascending=False).head(budget.max_videos_per_niche).copy()
+
+    now = datetime.now(timezone.utc)
+    pub = pd.to_datetime(dfv["published_at"], utc=True, errors="coerce")
+    age_days = (now - pub).dt.total_seconds() / 86400.0
+    age_days = age_days.clip(lower=0.25)
+    dfv["views_per_day"] = dfv["views"] / age_days
+
+    return dfv
+
+
+# -----------------------------
+# Main entry point: Global scan
 # -----------------------------
 
 def run_scan(
@@ -497,67 +784,17 @@ def run_scan(
         if not queries:
             continue
 
-        qlist = queries[: budget.queries_per_niche]
-
-        found_by: Dict[str, str] = {}
-        niche_video_ids: List[str] = []
-
-        for q in qlist:
-            # quota errors bubble to UI
-            ids = fetch_candidates(
-                youtube,
-                query=q,
-                published_after_iso=published_after,
-                max_results=budget.max_results_per_query,
-            )
-            for vid in ids:
-                if vid in found_by:
-                    continue
-                found_by[vid] = q
-                niche_video_ids.append(vid)
-
-        if not niche_video_ids:
+        # Scan one niche (may raise HttpError on quota)
+        dfv = _scan_one_niche(youtube, niche, queries, budget, published_after)
+        if dfv is None or dfv.empty:
             continue
 
         # global dedupe (first niche owns it for this run)
-        niche_video_ids = [vid for vid in niche_video_ids if vid not in global_seen_video_ids]
-        global_seen_video_ids.update(niche_video_ids)
+        dfv = dfv[~dfv["video_id"].isin(global_seen_video_ids)].copy()
+        global_seen_video_ids.update(dfv["video_id"].tolist())
 
-        if not niche_video_ids:
-            continue
-
-        # quota errors bubble to UI
-        dfv = fetch_videos(youtube, niche_video_ids)
         if dfv.empty:
             continue
-
-        dfv["niche"] = niche
-        dfv["source_query"] = dfv["video_id"].map(found_by)
-
-        # Shorts confidence
-        dfv["shorts_score"] = dfv.apply(
-            lambda r: shorts_confidence(
-                int(r.get("duration_s", 0) or 0),
-                r.get("title"),
-                r.get("description"),
-                r.get("source_query"),
-            ),
-            axis=1,
-        )
-
-        dfv = dfv[dfv["shorts_score"] >= budget.shorts_score_threshold].copy()
-        if dfv.empty:
-            continue
-
-        # cap to keep UI responsive / control downstream work
-        dfv = dfv.sort_values("views", ascending=False).head(budget.max_videos_per_niche).copy()
-
-        # Views per day
-        now = datetime.now(timezone.utc)
-        pub = pd.to_datetime(dfv["published_at"], utc=True, errors="coerce")
-        age_days = (now - pub).dt.total_seconds() / 86400.0
-        age_days = age_days.clip(lower=0.25)
-        dfv["views_per_day"] = dfv["views"] / age_days
 
         all_videos.append(dfv)
 
@@ -583,10 +820,9 @@ def run_scan(
         videos["video_url"] = "https://www.youtube.com/watch?v=" + videos["video_id"].astype(str)
         videos["channel_url"] = "https://www.youtube.com/channel/" + videos["channel_id"].astype(str)
 
-    # Persist
+    # Persist (global snapshot)
     if engine is not None and not videos.empty:
         _upsert_videos(engine, videos)
-
         if not channels.empty:
             _upsert_channels(engine, channels)
 
@@ -595,6 +831,152 @@ def run_scan(
         _insert_daily_stats(engine, stats)
 
     return videos, channels
+
+
+# -----------------------------
+# NEW: Niche deep scan (API) + persistence
+# -----------------------------
+
+def run_niche_scan(
+    api_key: str,
+    niche: str,
+    queries: List[str],
+    budget: Optional[ScanBudget] = None,
+    db_url: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Runs a niche-specific deep scan (API) and persists results into:
+      - videos, channels (upserts)
+      - niche_scan_runs (run metadata)
+      - niche_video_stats_daily (per-video stats keyed by video_id/date/niche)
+
+    Returns:
+      videos_df, channels_df, run_id
+
+    Quota errors (HttpError) bubble up to the caller.
+    """
+    if budget is None:
+        budget = ScanBudget()
+
+    if not db_url:
+        raise ValueError("run_niche_scan requires db_url (DB-first design).")
+
+    if not SQLALCHEMY_AVAILABLE:
+        raise RuntimeError("SQLAlchemy is not installed. pip install sqlalchemy")
+
+    engine = _get_engine(db_url)
+    _init_db(engine)
+
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Pre-insert run row as 'running'
+    _insert_niche_run(engine, {
+        "run_id": run_id,
+        "niche": niche,
+        "started_at": started_at,
+        "finished_at": None,
+        "scan_days": int(budget.scan_days),
+        "queries_per_niche": int(budget.queries_per_niche),
+        "max_results_per_query": int(budget.max_results_per_query),
+        "shorts_score_threshold": float(budget.shorts_score_threshold),
+        "max_videos_per_niche": int(budget.max_videos_per_niche),
+        "status": "running",
+        "error": None,
+    })
+
+    youtube = build("youtube", "v3", developerKey=api_key)
+    published_after = _iso_days_ago(budget.scan_days)
+
+    try:
+        videos = _scan_one_niche(youtube, niche, queries, budget, published_after)
+        if videos is None or videos.empty:
+            videos = pd.DataFrame(columns=[
+                "video_id", "title", "description", "channel_id", "channel_title", "published_at",
+                "duration_s", "views", "niche", "source_query", "shorts_score", "views_per_day"
+            ])
+
+        channels = fetch_channels(youtube, videos["channel_id"].dropna().unique().tolist())
+
+        # Join channel metadata into videos for UI convenience
+        if not videos.empty and not channels.empty:
+            ch_keep = ["channel_id", "created_at", "subscribers", "video_count", "total_views"]
+            videos = videos.merge(channels[ch_keep], on="channel_id", how="left")
+
+        if not videos.empty:
+            videos["video_url"] = "https://www.youtube.com/watch?v=" + videos["video_id"].astype(str)
+            videos["channel_url"] = "https://www.youtube.com/channel/" + videos["channel_id"].astype(str)
+
+        # Persist
+        if not videos.empty:
+            _upsert_videos(engine, videos)
+        if not channels.empty:
+            _upsert_channels(engine, channels)
+
+        # Niche stats persistence (date = today UTC)
+        if not videos.empty:
+            stats = videos[["video_id", "views", "views_per_day", "niche", "shorts_score", "source_query"]].copy()
+            stats["run_id"] = run_id
+            stats["date"] = date.today().isoformat()
+            # Ensure niche column is correct even if caller passed mismatched DF
+            stats["niche"] = niche
+            _insert_niche_stats_daily(engine, stats[[
+                "run_id", "video_id", "date", "niche", "views", "views_per_day", "shorts_score", "source_query"
+            ]])
+
+        finished_at = datetime.now(timezone.utc).isoformat()
+        _insert_niche_run(engine, {
+            "run_id": run_id,
+            "niche": niche,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "scan_days": int(budget.scan_days),
+            "queries_per_niche": int(budget.queries_per_niche),
+            "max_results_per_query": int(budget.max_results_per_query),
+            "shorts_score_threshold": float(budget.shorts_score_threshold),
+            "max_videos_per_niche": int(budget.max_videos_per_niche),
+            "status": "success",
+            "error": None,
+        })
+
+        return videos, channels, run_id
+
+    except HttpError as e:
+        # Bubble quota errors, but record run status first
+        finished_at = datetime.now(timezone.utc).isoformat()
+        _insert_niche_run(engine, {
+            "run_id": run_id,
+            "niche": niche,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "scan_days": int(budget.scan_days),
+            "queries_per_niche": int(budget.queries_per_niche),
+            "max_results_per_query": int(budget.max_results_per_query),
+            "shorts_score_threshold": float(budget.shorts_score_threshold),
+            "max_videos_per_niche": int(budget.max_videos_per_niche),
+            "status": "failed",
+            "error": _http_error_text(e),
+        })
+        _raise_if_quota(e)
+        # Non-quota HttpError: raise anyway (caller decides)
+        raise
+
+    except Exception as e:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        _insert_niche_run(engine, {
+            "run_id": run_id,
+            "niche": niche,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "scan_days": int(budget.scan_days),
+            "queries_per_niche": int(budget.queries_per_niche),
+            "max_results_per_query": int(budget.max_results_per_query),
+            "shorts_score_threshold": float(budget.shorts_score_threshold),
+            "max_videos_per_niche": int(budget.max_videos_per_niche),
+            "status": "failed",
+            "error": str(e),
+        })
+        raise
 
 
 # -----------------------------
@@ -618,6 +1000,7 @@ if __name__ == "__main__":
         max_videos_per_niche=int(os.getenv("MAX_VIDEOS_PER_NICHE", "120")),
     )
 
+    # Global scan
     try:
         videos_df, channels_df = run_scan(
             api_key=api_key,
@@ -625,11 +1008,28 @@ if __name__ == "__main__":
             budget=budget,
             db_url=db_url,
         )
-        print(f"Videos: {len(videos_df)} | Channels: {len(channels_df)}")
+        print(f"[GLOBAL] Videos: {len(videos_df)} | Channels: {len(channels_df)}")
     except HttpError as e:
-        print("API scan failed (likely quota/rate limit).")
+        print("[GLOBAL] API scan failed (likely quota/rate limit).")
         print(str(e))
+
+    # Example niche scan (optional)
+    if db_url and "sports" in QUERY_PACKS:
+        try:
+            v2, c2, rid = run_niche_scan(
+                api_key=api_key,
+                niche="sports",
+                queries=QUERY_PACKS["sports"],
+                budget=ScanBudget(queries_per_niche=2, max_results_per_query=15, scan_days=30, max_videos_per_niche=150),
+                db_url=db_url,
+            )
+            print(f"[NICHE] run_id={rid} | Videos: {len(v2)} | Channels: {len(c2)}")
+        except HttpError as e:
+            print("[NICHE] API scan failed (likely quota/rate limit).")
+            print(str(e))
 
     if db_url and SQLALCHEMY_AVAILABLE:
         snap = load_latest_snapshot(db_url)
-        print(f"Latest DB snapshot rows: {len(snap)}")
+        print(f"[DB] Latest global snapshot rows: {len(snap)}")
+        runs = load_niche_scan_runs(db_url)
+        print(f"[DB] Niche scan runs: {len(runs)}")
